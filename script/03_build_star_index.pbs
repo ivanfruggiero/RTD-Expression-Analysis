@@ -1,0 +1,97 @@
+#!/bin/bash
+#PBS -N build_star_index
+#PBS -l select=1:ncpus=12:mem=64gb
+#PBS -l walltime=12:00:00
+#PBS -q standard
+#PBS -j oe
+#PBS -o ../logs/build_star_index.log
+#PBS -m abe
+#PBS -M user@example.com
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: qsub script/03_build_star_index.pbs [options]
+  -r REFDIR      reference directory (default: ../reference)
+  -f FASTA       genome FASTA file (default: $REFDIR/genome.fa)
+  -g GTF         annotation GTF file (default: $REFDIR/annotations.gtf)
+  -o OUTDIR      output STAR index directory (default: ../results/star_index)
+  -t THREADS     number of threads (default: 12)
+  -s OVERHANG    sjdbOverhang value (default: 99)
+  -h             show this help message
+
+Example:
+  qsub script/03_build_star_index.pbs -r ../reference -f ../reference/genome.fa -g ../reference/annotations.gtf -o ../results/star_index -t 12 -s 99
+EOF
+}
+
+REFDIR=${REFDIR:-../reference}
+OUTDIR=${OUTDIR:-../results/star_index}
+THREADS=${THREADS:-12}
+OVERHANG=${OVERHANG:-99}
+
+while getopts ":r:f:g:o:t:s:h" opt; do
+  case $opt in
+    r) REFDIR=$OPTARG ;;
+    f) FASTA=$OPTARG ;;
+    g) GTF=$OPTARG ;;
+    o) OUTDIR=$OPTARG ;;
+    t) THREADS=$OPTARG ;;
+    s) OVERHANG=$OPTARG ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+FASTA=${FASTA:-$REFDIR/genome.fa}
+GTF=${GTF:-$REFDIR/annotations.gtf}
+
+WORKDIR=${PBS_O_WORKDIR:-$(pwd)}
+cd "$WORKDIR"
+
+mkdir -p "$REFDIR"
+mkdir -p "$OUTDIR"
+mkdir -p ../logs
+
+if [ ! -f "$FASTA" ]; then
+  echo "FASTA file not found: $FASTA" >&2
+  exit 1
+fi
+
+if [ ! -f "$GTF" ]; then
+  echo "GTF file not found: $GTF" >&2
+  exit 1
+fi
+
+cat <<EOF
+===============================
+[START] STAR index build
+WORKDIR: $WORKDIR
+REFDIR: $REFDIR
+FASTA:  $FASTA
+GTF:    $GTF
+OUTDIR: $OUTDIR
+THREADS: $THREADS
+OVERHANG: $OVERHANG
+===============================
+EOF
+
+module purge
+module load star/2.7.8a
+
+command -v STAR >/dev/null 2>&1 || { echo "STAR not found in PATH" >&2; exit 1; }
+STAR --version
+
+echo "[INFO] Generating STAR index..."
+
+STAR \
+  --runThreadN "$THREADS" \
+  --runMode genomeGenerate \
+  --genomeDir "$OUTDIR" \
+  --genomeFastaFiles "$FASTA" \
+  --sjdbGTFfile "$GTF" \
+  --sjdbOverhang "$OVERHANG"
+
+echo "===============================\n[DONE] STAR index generated in: $OUTDIR\n==============================="
