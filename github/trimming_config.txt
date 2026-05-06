@@ -1,0 +1,4 @@
+# Example trimming configuration
+# BIOPROJECT TRIM1 TRIM2 PHRED NLIMIT
+PRJ001 10 10 20 5
+PRJ002 5 5 20 5

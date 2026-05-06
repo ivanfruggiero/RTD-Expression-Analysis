@@ -1,0 +1,187 @@
+#!/bin/bash
+#PBS -N trimming_qc
+#PBS -l select=1:ncpus=12:mem=64gb
+#PBS -l walltime=48:00:00
+#PBS -q standard
+#PBS -j oe
+#PBS -o ../logs/trimming_qc.log
+#PBS -m abe
+#PBS -M user@example.com
+
+set -euo pipefail
+set -x
+
+usage() {
+  cat <<'EOF'
+Usage: qsub 02_trimming_qc.pbs [options]
+  -i RAWDIR     base directory for raw reads (default: ../raw_reads)
+  -o BASEDIR    base output directory (default: ../results/trimming_qc)
+  -c CONFIG     trimming configuration file (default: trimming_config.txt)
+  -t THREADS    total number of threads (default: 10)
+  -h            show this help message
+
+Example:
+  qsub script/02_trimming_qc.pbs -i ../raw_reads -o ../results/trimming_qc -c trimming_config.txt -t 10
+EOF
+}
+
+RAW_BASE=${RAW_BASE:-../raw_reads}
+BASEDIR=${BASEDIR:-../results/trimming_qc}
+CONFIG=${CONFIG:-trimming_config.txt}
+TOTAL_THREADS=${TOTAL_THREADS:-10}
+
+while getopts ":i:o:c:t:h" opt; do
+  case $opt in
+    i) RAW_BASE=$OPTARG ;;
+    o) BASEDIR=$OPTARG ;;
+    c) CONFIG=$OPTARG ;;
+    t) TOTAL_THREADS=$OPTARG ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+WORKDIR=${PBS_O_WORKDIR:-$(pwd)}
+cd "$WORKDIR"
+
+if [ ! -f "$CONFIG" ]; then
+  echo "Config file not found: $CONFIG" >&2
+  exit 1
+fi
+
+command -v fastp >/dev/null 2>&1 || { echo "fastp not found in PATH" >&2; exit 1; }
+command -v fastqc >/dev/null 2>&1 || { echo "fastqc not found in PATH" >&2; exit 1; }
+command -v multiqc >/dev/null 2>&1 || { echo "multiqc not found in PATH" >&2; exit 1; }
+
+THREADS=${TOTAL_THREADS}
+THREADS_PAIRED=$(( THREADS * 3 / 5 ))
+THREADS_SINGLE=$(( THREADS - THREADS_PAIRED ))
+THREADS_PAIRED=$(( THREADS_PAIRED > 0 ? THREADS_PAIRED : 1 ))
+THREADS_SINGLE=$(( THREADS_SINGLE > 0 ? THREADS_SINGLE : 1 ))
+
+NOW=$(date +"%Y-%m-%d_%H-%M-%S")
+LOGDIR="${BASEDIR}/logs/$NOW"
+REPORTDIR="${BASEDIR}/reports"
+TRIMDIR="${BASEDIR}/trimmed"
+FASTQC_DIR="${REPORTDIR}/fastqc"
+MULTIQC_DIR="${REPORTDIR}/multiqc"
+
+mkdir -p "$LOGDIR" "$TRIMDIR" "$FASTQC_DIR" "$MULTIQC_DIR"
+
+echo "Raw reads base: $RAW_BASE"
+echo "Output base: $BASEDIR"
+echo "Config: $CONFIG"
+echo "Threads: $THREADS ($THREADS_PAIRED paired, $THREADS_SINGLE single)"
+echo "Log directory: $LOGDIR"
+
+echo "Inizio trimming + QC: $(date)"
+
+# Read the config file ignoring comments and empty lines
+while IFS= read -r line; do
+  case "$line" in
+    \#*|"") continue ;;
+  esac
+  BIOPROJECT=$(echo "$line" | awk '{print $1}')
+  TRIM1=$(echo "$line" | awk '{print $2}')
+  TRIM2=$(echo "$line" | awk '{print $3}')
+  PHRED=$(echo "$line" | awk '{print $4}')
+  NLIMIT=$(echo "$line" | awk '{print $5}')
+
+  if [ -z "$BIOPROJECT" ]; then
+    continue
+  fi
+
+  echo "\n=== Project: $BIOPROJECT ==="
+
+  RAW_PAIRED="$RAW_BASE/paired/$BIOPROJECT"
+  RAW_SINGLE="$RAW_BASE/single/$BIOPROJECT"
+
+  if [ -d "$RAW_PAIRED" ]; then
+    find "$RAW_PAIRED" -maxdepth 1 -type f -name "*_1.fastq.gz" | sort | while read -r fq1; do
+      fq2="${fq1/_1.fastq.gz/_2.fastq.gz}"
+      if [ ! -f "$fq2" ]; then
+        echo "Paired file not found for $fq1, skipping." >&2
+        continue
+      fi
+      SRR=$(basename "$fq1" _1.fastq.gz)
+      OUT_DIR="$TRIMDIR/paired/$BIOPROJECT"
+      FASTQC_OUT="$FASTQC_DIR/trimmed/paired/$BIOPROJECT"
+      FASTP_OUT="$BASEDIR/fastp_reports/paired/$BIOPROJECT"
+      mkdir -p "$OUT_DIR" "$FASTQC_OUT" "$FASTP_OUT"
+
+      out1="$OUT_DIR/${SRR}_1.trimmed.fastq.gz"
+      out2="$OUT_DIR/${SRR}_2.trimmed.fastq.gz"
+      json="$FASTP_OUT/${SRR}_${NOW}.json"
+      html="$FASTP_OUT/${SRR}_${NOW}.html"
+      log_fp="$LOGDIR/${SRR}_fastp_${NOW}.log"
+      log_fq="$LOGDIR/${SRR}_fastqc_trimmed_${NOW}.log"
+
+      echo "Trimming paired: $SRR"
+      fastp \
+        -i "$fq1" \
+        -I "$fq2" \
+        -o "$out1" \
+        -O "$out2" \
+        --trim_front1 "$TRIM1" \
+        --trim_front2 "$TRIM2" \
+        --qualified_quality_phred "$PHRED" \
+        --unqualified_percent_limit 50 \
+        --n_base_limit "$NLIMIT" \
+        --detect_adapter_for_pe \
+        --thread "$THREADS_PAIRED" \
+        --json "$json" \
+        --html "$html" \
+        --report_title "Trimming Report - ${SRR}" \
+        > "$log_fp" 2>&1
+
+      fastqc "$out1" "$out2" -o "$FASTQC_OUT" > "$log_fq" 2>&1
+    done
+  else
+    echo "No paired directory found for $BIOPROJECT: $RAW_PAIRED"
+  fi
+
+  if [ -d "$RAW_SINGLE" ]; then
+    find "$RAW_SINGLE" -maxdepth 1 -type f -name "*.fastq.gz" | sort | grep -vE '_[12]\.fastq\.gz$' | while read -r fq1; do
+      SRR=$(basename "$fq1" .fastq.gz)
+      OUT_DIR="$TRIMDIR/single/$BIOPROJECT"
+      FASTQC_OUT="$FASTQC_DIR/trimmed/single/$BIOPROJECT"
+      FASTP_OUT="$BASEDIR/fastp_reports/single/$BIOPROJECT"
+      mkdir -p "$OUT_DIR" "$FASTQC_OUT" "$FASTP_OUT"
+
+      out="$OUT_DIR/${SRR}.trimmed.fastq.gz"
+      json="$FASTP_OUT/${SRR}_${NOW}.json"
+      html="$FASTP_OUT/${SRR}_${NOW}.html"
+      log_fp="$LOGDIR/${SRR}_fastp_${NOW}.log"
+      log_fq="$LOGDIR/${SRR}_fastqc_trimmed_${NOW}.log"
+
+      echo "Trimming single: $SRR"
+      fastp \
+        -i "$fq1" \
+        -o "$out" \
+        --trim_front1 "$TRIM1" \
+        --qualified_quality_phred "$PHRED" \
+        --unqualified_percent_limit 50 \
+        --n_base_limit "$NLIMIT" \
+        --thread "$THREADS_SINGLE" \
+        --json "$json" \
+        --html "$html" \
+        --report_title "Trimming Report - ${SRR}" \
+        > "$log_fp" 2>&1
+
+      fastqc "$out" -o "$FASTQC_OUT" > "$log_fq" 2>&1
+    done
+  else
+    echo "No single-end directory found for $BIOPROJECT: $RAW_SINGLE"
+  fi
+
+done < <(grep -E -v '^\s*(#|$)' "$CONFIG")
+
+echo "Running MultiQC post-trim..."
+if compgen -G "$FASTQC_DIR/trimmed/*/*/*.zip" > /dev/null; then
+  multiqc "$FASTQC_DIR/trimmed" -o "$MULTIQC_DIR" > "$LOGDIR/multiqc_after_trim_${NOW}.log" 2>&1
+else
+  echo "No FastQC files found, skipping MultiQC"
+fi
+
+echo "Trimming + QC completed at $(date)"

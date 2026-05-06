@@ -1,0 +1,126 @@
+#!/bin/bash
+#PBS -N star_2pass_alignment
+#PBS -l select=1:ncpus=16:mem=128gb
+#PBS -l walltime=72:00:00
+#PBS -q standard
+#PBS -j oe
+#PBS -o ../logs/star_2pass_alignment.log
+#PBS -m abe
+#PBS -M user@example.com
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: qsub script/04_star_2pass_alignment.pbs [options]
+  -i INPUTDIR    base directory for trimmed reads (default: ../results/trimming_qc/trimmed)
+  -r STAR_INDEX  STAR genome index directory (default: ../results/star_index)
+  -o OUTDIR      output base directory (default: ../results/star_alignment)
+  -t THREADS     number of threads for STAR (default: 12)
+  -s SJDB        sjdbOverhang used in STAR index (default: 99)
+  -m RAM         limitBAMsortRAM in bytes (default: 110000000000)
+  -h             show this help message
+
+Example:
+  qsub script/04_star_2pass_alignment.pbs -i ../results/trimming_qc/trimmed -r ../results/star_index -o ../results/star_alignment -t 12
+EOF
+}
+
+INPUTDIR=${INPUTDIR:-../results/trimming_qc/trimmed}
+STAR_INDEX=${STAR_INDEX:-../results/star_index}
+OUTDIR=${OUTDIR:-../results/star_alignment}
+THREADS=${THREADS:-12}
+SJDB_OVERHANG=${SJDB_OVERHANG:-99}
+SORT_RAM=${SORT_RAM:-110000000000}
+
+while getopts ":i:r:o:t:s:m:h" opt; do
+  case $opt in
+    i) INPUTDIR=$OPTARG ;;
+    r) STAR_INDEX=$OPTARG ;;
+    o) OUTDIR=$OPTARG ;;
+    t) THREADS=$OPTARG ;;
+    s) SJDB_OVERHANG=$OPTARG ;;
+    m) SORT_RAM=$OPTARG ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+WORKDIR=${PBS_O_WORKDIR:-$(pwd)}
+cd "$WORKDIR"
+
+command -v STAR >/dev/null 2>&1 || { echo "STAR not found in PATH" >&2; exit 1; }
+
+if [ ! -d "$INPUTDIR" ]; then
+  echo "Input directory not found: $INPUTDIR" >&2
+  exit 1
+fi
+
+if [ ! -d "$STAR_INDEX" ]; then
+  echo "STAR index directory not found: $STAR_INDEX" >&2
+  exit 1
+fi
+
+PASS1_DIR="$OUTDIR/pass1"
+PASS2_DIR="$OUTDIR/pass2"
+LOGDIR="$OUTDIR/logs"
+
+mkdir -p "$PASS1_DIR" "$PASS2_DIR" "$LOGDIR"
+
+echo "=============================="
+echo "[START] STAR 2-pass alignment"
+echo "WORKDIR: $WORKDIR"
+echo "INPUTDIR: $INPUTDIR"
+echo "STAR_INDEX: $STAR_INDEX"
+echo "OUTDIR: $OUTDIR"
+echo "THREADS: $THREADS"
+echo "SJDB_OVERHANG: $SJDB_OVERHANG"
+echo "SORT_RAM: $SORT_RAM"
+echo "=============================="
+
+find "$INPUTDIR" -type f -name "*_1.trimmed.fastq.gz" | sort | while read -r R1; do
+  R2="${R1/_1.trimmed.fastq.gz/_2.trimmed.fastq.gz}"
+  if [ ! -f "$R2" ]; then
+    echo "[WARN] R2 not found for $R1, skipping" >&2
+    continue
+  fi
+
+  SAMPLE=$(basename "$R1" _1.trimmed.fastq.gz)
+  BIOPROJECT=$(basename "$(dirname "$(dirname "$R1")")")
+  OUT_PREFIX1="$PASS1_DIR/${BIOPROJECT}_${SAMPLE}_"
+  OUT_PREFIX2="$PASS2_DIR/${BIOPROJECT}_${SAMPLE}_"
+  LOG1="$LOGDIR/${BIOPROJECT}_${SAMPLE}_pass1.log"
+  LOG2="$LOGDIR/${BIOPROJECT}_${SAMPLE}_pass2.log"
+
+  echo "\n[START] $BIOPROJECT / $SAMPLE"
+  echo "R1: $R1"
+  echo "R2: $R2"
+
+  STAR \
+    --runThreadN "$THREADS" \
+    --runMode alignReads \
+    --genomeDir "$STAR_INDEX" \
+    --readFilesIn "$R1" "$R2" \
+    --readFilesCommand zcat \
+    --outFileNamePrefix "$OUT_PREFIX1" \
+    --outSAMtype None \
+    > "$LOG1" 2>&1
+
+  STAR \
+    --runThreadN "$THREADS" \
+    --genomeDir "$STAR_INDEX" \
+    --readFilesIn "$R1" "$R2" \
+    --readFilesCommand zcat \
+    --sjdbFileChrStartEnd "${OUT_PREFIX1}SJ.out.tab" \
+    --outFileNamePrefix "$OUT_PREFIX2" \
+    --outSAMtype BAM SortedByCoordinate \
+    --outSAMstrandField intronMotif \
+    --outSAMattributes NH HI AS nM XS \
+    --limitBAMsortRAM "$SORT_RAM" \
+    > "$LOG2" 2>&1
+
+  echo "[DONE] $BIOPROJECT / $SAMPLE"
+done
+
+echo "[FINISHED] STAR 2-pass alignment completed"
