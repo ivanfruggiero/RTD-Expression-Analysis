@@ -23,37 +23,6 @@ This folder contains clean, reproducible PBS scripts for RNA-seq data analysis.
 - `github/trimming_config.txt`
   - trimming parameter configuration
 
-## GitHub repository guidance
-
-When creating the repository, keep the focus on reproducible scripts and ignore large data files or temporary results.
-
-- Track in Git:
-  - `script/`
-  - `README.md`
-  - `trimming_config.txt`
-  - example configuration files
-- Ignore in `.gitignore`:
-  - `raw_reads/`
-  - `results/`
-  - `logs/`
-  - `*.log`
-  - `*.bam`
-  - `*.gz`
-
-Example `.gitignore`:
-
-```gitignore
-raw_reads/
-results/
-logs/
-*.log
-*.bam
-*.sam
-*.fastq.gz
-*.fq.gz
-```
-
-If you include reference files in `reference/`, consider only adding small files or using a separate repository for genome references.
 
 ## Running scripts with parameters
 
