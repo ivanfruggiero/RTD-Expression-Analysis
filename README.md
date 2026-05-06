@@ -24,6 +24,33 @@ This folder contains clean, reproducible PBS scripts for RNA-seq data analysis.
   - trimming parameter configuration
 
 
+### Software dependencies
+- `bash` and PBS job scheduler environment
+- `fastp` for read trimming
+- `fastqc` and `multiqc` for quality control
+- `STAR` for genome indexing and alignment
+- `scallop` and/or `stringtie` for transcript assembly
+- `samtools` for BAM indexing and optional StringTie support
+- `RTDmaker.py` for Reference Transcriptome Database assembly
+- `TransDecoder.LongOrfs` and `TransDecoder.Predict` for peptide prediction
+- `salmon` for transcript quantification
+- `Rscript` with R packages: `tximport`, `readr`, `dplyr`, `tidyr`, `DESeq2`, `ggplot2`, and optional `apeglm`
+- `interproscan.sh` for InterProScan annotation
+- `busco` for BUSCO completeness assessment
+
+### Data requirements
+- Paired-end raw reads under `raw_reads/paired/<BIOPROJECT>/`
+- Single-end raw reads under `raw_reads/single/<BIOPROJECT>/`
+- Reference genome FASTA and annotation GTF in `reference/`
+- Optional BUSCO lineage database under `reference/`
+- Optional transcriptome metadata CSV files under `metadata/`
+
+### Storage guidance
+- Keep raw FASTQ files and results on a fast and large filesystem
+- `results/` can grow quickly; allocate multiple TB for large experiments
+- `logs/` and intermediate steps should be excluded from Git
+
+
 ## Running scripts with parameters
 
 The scripts are designed to receive command-line options, so you can submit jobs flexibly:
@@ -326,13 +353,7 @@ PRJ002 5 5 20 5
 
 Lines starting with `#` are ignored.
 
-## Software requirements
 
-The scripts require these tools to be available in `PATH`:
-
-- `fastp`
-- `fastqc`
-- `multiqc`
 
 If using a module system or Conda environment, activate it before submitting jobs.
 
