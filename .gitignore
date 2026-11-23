@@ -1,0 +1,12 @@
+# Data and outputs are not tracked
+raw_reads/
+reference/
+results/
+logs/*
+!logs/.gitkeep
+
+# OS / editor
+.DS_Store
+.Rhistory
+.RData
+__pycache__/

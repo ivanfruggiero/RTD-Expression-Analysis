@@ -1,0 +1,53 @@
+#!/bin/bash
+#PBS -N 04_star_index
+#PBS -l select=1:ncpus=12:mem=64gb
+#PBS -l walltime=12:00:00
+#PBS -j oe
+#PBS -o logs/04_star_index.log
+
+# Step 04 - STAR genome index.
+# Set OVERHANG to (read length - 1) of your libraries; 99 suits 2x100 bp reads.
+
+set -euo pipefail
+source "${PBS_O_WORKDIR:-$PWD}/script/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: qsub -v GENOME_FA=...,REF_GTF=...,OUTDIR=... script/04_build_star_index.pbs
+   or: bash script/04_build_star_index.pbs [-f GENOME_FA] [-g REF_GTF] [-o OUTDIR] [-t THREADS] [-s OVERHANG]
+  -f GENOME_FA  genome FASTA                (default: reference/genome.fa)
+  -g REF_GTF    reference annotation GTF    (default: reference/annotation.gtf)
+  -o OUTDIR     STAR index directory        (default: results/04_star_index)
+  -t THREADS    threads                     (default: NCPUS or 12)
+  -s OVERHANG   --sjdbOverhang              (default: 99)
+USAGE
+}
+
+GENOME_FA=${GENOME_FA:-reference/genome.fa}
+REF_GTF=${REF_GTF:-reference/annotation.gtf}
+OUTDIR=${OUTDIR:-results/04_star_index}
+THREADS=${THREADS:-$(ncpus 12)}
+OVERHANG=${OVERHANG:-99}
+
+while getopts ":f:g:o:t:s:h" opt; do
+  case $opt in
+    f) GENOME_FA=$OPTARG ;; g) REF_GTF=$OPTARG ;; o) OUTDIR=$OPTARG ;;
+    t) THREADS=$OPTARG ;; s) OVERHANG=$OPTARG ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+setup_env
+require_cmd STAR
+require_file "$GENOME_FA"
+require_file "$REF_GTF"
+mkdir -p "$OUTDIR"
+
+log "STAR $(STAR --version) | FASTA=$GENOME_FA GTF=$REF_GTF OUT=$OUTDIR THREADS=$THREADS OVERHANG=$OVERHANG"
+STAR --runThreadN "$THREADS" --runMode genomeGenerate \
+  --genomeDir "$OUTDIR" --genomeFastaFiles "$GENOME_FA" \
+  --sjdbGTFfile "$REF_GTF" --sjdbOverhang "$OVERHANG" \
+  --outFileNamePrefix "$OUTDIR/"
+log "Done: $OUTDIR"

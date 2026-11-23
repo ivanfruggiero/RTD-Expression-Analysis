@@ -1,0 +1,7 @@
+# Contaminant genomes for step 03 (tab-separated). Lines starting with # are ignored.
+# name<TAB>source   (source = NCBI assembly accession, downloaded with NCBI datasets, or path to a FASTA file)
+# Do not list the host genome here: it is given separately (HOST_FA).
+phix	GCF_000819615.1
+ecoli	GCF_000005845.2
+yeast	GCF_000146045.2
+human	GCF_000001405.40

@@ -1,0 +1,84 @@
+#!/bin/bash
+#PBS -N 05_star_2pass
+#PBS -l select=1:ncpus=16:mem=128gb
+#PBS -l walltime=72:00:00
+#PBS -j oe
+#PBS -o logs/05_star_2pass.log
+
+# Step 05 - Per-sample STAR two-pass alignment.
+# Pass 1 discovers splice junctions (SJ.out.tab, also used by RTDmaker in step 07);
+# pass 2 re-aligns inserting the sample's pass-1 junctions and writes a sorted BAM.
+# Handles paired-end and single-end samples. Reads: decontaminated (step 03) by default;
+# set READS_DIR=results/02_trimming/trimmed to skip screening.
+# Output names: <BIOPROJECT>_<SAMPLE>_{SJ.out.tab,Aligned.sortedByCoord.out.bam}
+
+set -euo pipefail
+source "${PBS_O_WORKDIR:-$PWD}/script/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: qsub -v READS_DIR=...,STAR_INDEX=...,OUTDIR=... script/05_star_2pass_alignment.pbs
+   or: bash script/05_star_2pass_alignment.pbs [-i READS_DIR] [-r STAR_INDEX] [-o OUTDIR] [-t THREADS] [-m SORT_RAM] [-f]
+  -i READS_DIR   reads from step 03 (or 02)    (default: results/03_screening/clean)
+  -r STAR_INDEX  STAR index from step 04       (default: results/04_star_index)
+  -o OUTDIR      output directory              (default: results/05_star)
+  -t THREADS     threads                       (default: NCPUS or 16)
+  -m SORT_RAM    --limitBAMsortRAM in bytes    (default: 110000000000)
+  -f             re-run samples that already have a BAM
+USAGE
+}
+
+READS_DIR=${READS_DIR:-results/03_screening/clean}
+STAR_INDEX=${STAR_INDEX:-results/04_star_index}
+OUTDIR=${OUTDIR:-results/05_star}
+THREADS=${THREADS:-$(ncpus 16)}
+SORT_RAM=${SORT_RAM:-110000000000}
+FORCE=${FORCE:-0}
+
+while getopts ":i:r:o:t:m:fh" opt; do
+  case $opt in
+    i) READS_DIR=$OPTARG ;; r) STAR_INDEX=$OPTARG ;; o) OUTDIR=$OPTARG ;;
+    t) THREADS=$OPTARG ;; m) SORT_RAM=$OPTARG ;; f) FORCE=1 ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+setup_env
+require_cmd STAR
+require_dir "$READS_DIR"
+require_file "$STAR_INDEX/SA"
+
+PASS1="$OUTDIR/pass1"; PASS2="$OUTDIR/pass2"; LOGDIR="$OUTDIR/logs"
+mkdir -p "$PASS1" "$PASS2" "$LOGDIR"
+log "STAR $(STAR --version) | READS_DIR=$READS_DIR INDEX=$STAR_INDEX OUT=$OUTDIR THREADS=$THREADS"
+
+n=0
+while IFS=$'\t' read -r BP S R1 R2; do
+  ID="${BP}_${S}"
+  P1="$PASS1/${ID}_"; P2="$PASS2/${ID}_"
+  if [ "$FORCE" -eq 0 ] && [ -s "${P2}Aligned.sortedByCoord.out.bam" ]; then
+    log "[SKIP] $ID (BAM exists)"; continue
+  fi
+  if [ -n "$R2" ]; then READS=("$R1" "$R2"); else READS=("$R1"); fi
+  log "[RUN] $ID (${#READS[@]} file(s))"
+
+  STAR --runThreadN "$THREADS" --genomeDir "$STAR_INDEX" \
+    --readFilesIn "${READS[@]}" --readFilesCommand zcat \
+    --outFileNamePrefix "$P1" --outSAMtype None \
+    > "$LOGDIR/${ID}_pass1.log" 2>&1 < /dev/null
+
+  STAR --runThreadN "$THREADS" --genomeDir "$STAR_INDEX" \
+    --readFilesIn "${READS[@]}" --readFilesCommand zcat \
+    --sjdbFileChrStartEnd "${P1}SJ.out.tab" \
+    --outFileNamePrefix "$P2" \
+    --outSAMtype BAM SortedByCoordinate \
+    --outSAMstrandField intronMotif \
+    --outSAMattributes NH HI AS nM XS \
+    --limitBAMsortRAM "$SORT_RAM" \
+    > "$LOGDIR/${ID}_pass2.log" 2>&1 < /dev/null
+  n=$((n + 1))
+done < <(list_trimmed_samples "$READS_DIR")
+
+log "Aligned $n sample(s). Mapping summary: $PASS2/*Log.final.out"

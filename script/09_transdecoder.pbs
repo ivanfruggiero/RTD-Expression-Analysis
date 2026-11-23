@@ -1,0 +1,49 @@
+#!/bin/bash
+#PBS -N 09_transdecoder
+#PBS -l select=1:ncpus=4:mem=32gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o logs/09_transdecoder.log
+
+# Step 09 - ORF / peptide prediction on the RTD transcripts with TransDecoder
+# (LongOrfs + Predict, default settings, no homology evidence).
+# Output: OUTDIR/<input basename>.transdecoder.{pep,cds,gff3,bed}
+
+set -euo pipefail
+source "${PBS_O_WORKDIR:-$PWD}/script/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: qsub [-v INPUT_FA=...] script/09_transdecoder.pbs
+   or: bash script/09_transdecoder.pbs [-i INPUT_FA] [-o OUTDIR]
+  -i INPUT_FA  RTD transcript FASTA   (default: results/07_rtdmaker/RTD_RTDmaker_output/RTD.fixed.fa)
+  -o OUTDIR    output directory       (default: results/09_transdecoder)
+USAGE
+}
+
+INPUT_FA=${INPUT_FA:-results/07_rtdmaker/RTD_RTDmaker_output/RTD.fixed.fa}
+OUTDIR=${OUTDIR:-results/09_transdecoder}
+
+while getopts ":i:o:h" opt; do
+  case $opt in
+    i) INPUT_FA=$OPTARG ;; o) OUTDIR=$OPTARG ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+setup_env
+require_cmd TransDecoder.LongOrfs TransDecoder.Predict
+require_file "$INPUT_FA"
+mkdir -p "$OUTDIR"
+
+# Absolute input path, because TransDecoder writes into the current directory.
+INPUT_ABS="$(cd "$(dirname "$INPUT_FA")" && pwd -P)/$(basename "$INPUT_FA")"
+cd "$OUTDIR"
+
+log "TransDecoder.LongOrfs on $INPUT_ABS"
+TransDecoder.LongOrfs -t "$INPUT_ABS"
+log "TransDecoder.Predict"
+TransDecoder.Predict -t "$INPUT_ABS"
+log "Done: $OUTDIR/$(basename "$INPUT_FA").transdecoder.pep"

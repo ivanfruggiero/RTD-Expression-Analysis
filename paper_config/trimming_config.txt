@@ -1,0 +1,9 @@
+# fastp parameters used for all BioProjects (as recorded in the fastp logs of the original run)
+# BIOPROJECT  TRIM_FRONT1  TRIM_FRONT2  MIN_PHRED  N_BASE_LIMIT
+PRJNA348468  10  10  20  15
+PRJNA688894  10  10  20  15
+PRJNA734968  10  10  20  15
+PRJNA739184  10  10  20  15
+PRJNA739186  10  10  20  15
+PRJNA838230  10  10  20  15
+PRJNA941950  10  10  20  15

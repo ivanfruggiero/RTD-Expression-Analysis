@@ -1,359 +1,217 @@
-# RNA-seq Pipeline Scripts
+# RTD-Expression-Analysis
 
-This folder contains clean, reproducible PBS scripts for RNA-seq data analysis.
+A pipeline for public RNA-seq data from many independent studies. It builds a
+**Reference Transcript Dataset (RTD)** from the data themselves, then quantifies gene expression
+on it. Next it runs a differential expression analysis for each study and combines the studies in a
+**gene-wise multilevel meta-analysis**. Finally it tests the resulting gene sets for GO enrichment.
 
-## Recommended repository structure
+The pipeline is generic and works for any organism with a reference genome and annotation.
+Each step is a PBS job script that you can also run with plain `bash`.
 
-- `github/raw_reads/`
-  - `paired/`
-    - `<BIOPROJECT>/`
-      - `sample_1.fastq.gz`
-      - `sample_2.fastq.gz`
-  - `single/`
-    - `<BIOPROJECT>/`
-      - `sample.fastq.gz`
-- `github/results/`
-  - analysis outputs
-- `github/logs/`
-  - execution logs
-- `github/reference/`
-  - reference files for STAR and other steps
-- `github/script/`
-  - executable PBS scripts
-- `github/trimming_config.txt`
-  - trimming parameter configuration
+```
+raw reads
+  └─ 01 FastQC/MultiQC
+  └─ 02 fastp trimming
+       └─ 03 contaminant screening ───────────────────────────┐
+            └─ 05 STAR 2-pass  (◄ 04 STAR index)              │
+                 └─ 06 Scallop + StringTie                    │
+                      └─ 07 RTDmaker ─► RTD + tx2gene         │
+                           ├─ 08 BUSCO (transcripts)          │
+                           ├─ 09 TransDecoder (+ 10 BUSCO)    │
+                           │    └─ 12 InterProScan (GO) ──────┼──────────┐
+                           └─ 11 Salmon ◄─────────────────────┘          │
+                                └─ 13 DESeq2 per study                   │
+                                     └─ 14 meta-analysis                 │
+                                          └─ 15 GO enrichment ◄──────────┘
+```
 
+## Contents
 
-### Software dependencies
-- `bash` and PBS job scheduler environment
-- `fastp` for read trimming
-- `fastqc` and `multiqc` for quality control
-- `STAR` for genome indexing and alignment
-- `scallop` and/or `stringtie` for transcript assembly
-- `samtools` for BAM indexing and optional StringTie support
-- `RTDmaker.py` for Reference Transcriptome Database assembly
-- `TransDecoder.LongOrfs` and `TransDecoder.Predict` for peptide prediction
-- `salmon` for transcript quantification
-- `Rscript` with R packages: `tximport`, `readr`, `dplyr`, `tidyr`, `DESeq2`, `ggplot2`, and optional `apeglm`
-- `interproscan.sh` for InterProScan annotation
-- `busco` for BUSCO completeness assessment
+| Path | What it is |
+|---|---|
+| `script/NN_*.pbs` | The 15 pipeline steps |
+| `script/common.sh` | Helpers that every step sources: environment set-up, input checks, sample discovery |
+| `script/R/` | R code for steps 13–15 |
+| `config/trimming_config.txt` | fastp parameters for each BioProject (template) |
+| `config/example_contaminants.tsv` | Contaminant genomes for the screening step (template) |
+| `config/example_study_groups.tsv` | Example grouping of studies for the meta-analysis |
+| `metadata/` | One CSV for each study for DESeq2 (format: [metadata/README.md](metadata/README.md)) |
+| `paper_config/` | Inputs and settings of the published analysis ([paper_config/README.md](paper_config/README.md)) |
+| `logs/` | Scheduler logs |
 
-### Data requirements
-- Paired-end raw reads under `raw_reads/paired/<BIOPROJECT>/`
-- Single-end raw reads under `raw_reads/single/<BIOPROJECT>/`
-- Reference genome FASTA and annotation GTF in `reference/`
-- Optional BUSCO lineage database under `reference/`
-- Optional transcriptome metadata CSV files under `metadata/`
+Raw reads, reference files and results are not tracked by Git (see `.gitignore`).
 
-### Storage guidance
-- Keep raw FASTQ files and results on a fast and large filesystem
-- `results/` can grow quickly; allocate multiple TB for large experiments
-- `logs/` and intermediate steps should be excluded from Git
+## Running a step
 
-
-## Running scripts with parameters
-
-The scripts are designed to receive command-line options, so you can submit jobs flexibly:
+Run every step **from the repository root**. All paths are relative to the root, and the defaults
+chain the steps together, so you normally only set the inputs of the first steps.
 
 ```bash
-qsub script/02_trimming_qc.pbs -i ../raw_reads -o ../results/trimming_qc -c trimming_config.txt -t 10
+# With a PBS scheduler (PBS Pro / OpenPBS / Torque): set parameters as environment variables with -v
+qsub -v GENOME_FA=reference/genome.fa,REF_GTF=reference/annotation.gtf script/04_build_star_index.pbs
+
+# Without a scheduler, or interactively: use the command-line options
+bash script/04_build_star_index.pbs -f reference/genome.fa -g reference/annotation.gtf -t 8
+
+# Help for any step
+bash script/04_build_star_index.pbs -h
 ```
 
-### Supported options for `02_trimming_qc.pbs`
+`qsub` does not pass command-line arguments to a job script, so on a cluster always use `-v`.
+Each option of a step has an environment variable of the same meaning; `-h` lists both.
 
-- `-i RAWDIR` : base folder of raw reads (default `../raw_reads`)
-- `-o BASEDIR` : base folder for results (default `../results/trimming_qc`)
-- `-c CONFIG` : trimming configuration file (default `trimming_config.txt`)
-- `-t THREADS` : total number of threads to use (default `10`)
-- `-h` : show this help message
+**Software.** Each step checks that its tools are in `PATH` and stops with a clear message if they
+are not. To load them inside the job, set either variable:
 
-## STAR index
+- `MODULES="star/2.7.8a samtools/1.13"` to load environment modules
+- `CONDA_ENV=myenv` to activate a conda environment
 
-The script `script/03_build_star_index.pbs` builds a STAR index reproducibly using generic reference files.
+For example: `qsub -v MODULES="salmon/1.9.0" script/11_salmon_quantification.pbs`.
 
-### Example execution
+**Resources.** The `#PBS -l select=...:ncpus=...:mem=...` and `walltime` lines in each script are
+starting values. Change them to fit your data and your cluster. Add `#PBS -q <queue>`
+if your site requires a queue. Thread counts default to the CPUs the scheduler grants (`NCPUS`).
 
-```bash
-qsub script/03_build_star_index.pbs -r ../reference -f ../reference/genome.fa -g ../reference/annotations.gtf -o ../results/star_index -t 12 -s 99
+**Re-runs.** Steps 03, 05, 06 and 11 skip samples that already have an output; `-f` forces a re-run.
+
+## Input layout
+
+```
+raw_reads/
+  paired/<BIOPROJECT>/<SAMPLE>_1.fastq.gz  <SAMPLE>_2.fastq.gz
+  single/<BIOPROJECT>/<SAMPLE>.fastq.gz
+reference/
+  genome.fa            # genome FASTA
+  annotation.gtf       # reference annotation (GTF)
+config/trimming_config.txt
+config/contaminants.tsv  # contaminant genomes for step 03
+metadata/<STUDY>.csv   # one file per study, sample IDs = <SAMPLE> above
 ```
 
-### Supported options for `03_build_star_index.pbs`
+`<SAMPLE>` is normally the SRA run accession. It must be unique across all studies, because it
+names the Salmon quantification folder and links reads to metadata.
 
-- `-r REFDIR` : reference file directory (default `../reference`)
-- `-f FASTA` : genome FASTA file (default `../reference/genome.fa`)
-- `-g GTF` : annotation GTF file (default `../reference/annotations.gtf`)
-- `-o OUTDIR` : STAR index output directory (default `../results/star_index`)
-- `-t THREADS` : STAR thread count (default `12`)
-- `-s OVERHANG` : `sjdbOverhang` value (default `99`)
-- `-h` : show this help message
+## Steps
 
-## STAR 2-pass alignment
+| # | Script | Does | Main output (under `results/`) |
+|---|---|---|---|
+| 01 | `01_fastqc_multiqc.pbs` | FastQC and MultiQC on raw reads | `01_fastqc_raw/` |
+| 02 | `02_trimming_qc.pbs` | fastp trimming with per-BioProject parameters, then FastQC/MultiQC | `02_trimming/trimmed/{paired,single}/<BP>/` |
+| 03 | `03_contamination_screening.pbs` | Remove reads of contaminant organisms (HISAT2 to contaminants, re-check on the host) | `03_screening/clean/{paired,single}/<BP>/`, `03_screening/summary.tsv` |
+| 04 | `04_build_star_index.pbs` | STAR genome index (`OVERHANG` = read length − 1) | `04_star_index/` |
+| 05 | `05_star_2pass_alignment.pbs` | Per-sample STAR 2-pass alignment (paired and single-end) | `05_star/pass1/*SJ.out.tab`, `05_star/pass2/*.bam` |
+| 06 | `06_assembly.pbs` | Reference-guided assembly of each BAM with Scallop and/or StringTie | `06_assembly/{scallop,stringtie}/*.gtf` |
+| 07 | `07_rtdmaker.pbs` | Merge the assemblies into the RTD with RTDmaker ShortReads; build `tx2gene.tsv` | `07_rtdmaker/<OUTNAME>_RTDmaker_output/`, `07_rtdmaker/tx2gene.tsv` |
+| 08 | `08_busco_transcriptome.pbs` | BUSCO on RTD transcripts (`LINEAGE` required) | `08_busco_rtd/` |
+| 09 | `09_transdecoder.pbs` | ORF and peptide prediction (TransDecoder LongOrfs + Predict) | `09_transdecoder/*.pep` |
+| 10 | `10_busco_peptides.pbs` | BUSCO on predicted peptides (`LINEAGE` required) | `10_busco_peptides/` |
+| 11 | `11_salmon_quantification.pbs` | Salmon index on the RTD and quantification of each sample | `11_salmon/quants/<SAMPLE>/quant.sf` |
+| 12 | `12_interproscan.pbs` | InterProScan annotation with GO terms (stop codons removed first) | `12_interproscan/*.tsv` |
+| 13 | `13_deseq2.pbs` | DESeq2 for each study, one study per metadata file | `13_deseq2/<STUDY>/`, `13_deseq2/contrasts.tsv` |
+| 14 | `14_meta_analysis.pbs` | Gene-wise multilevel random-effects meta-analysis | `14_meta_analysis/<GROUP>/` |
+| 15 | `15_go_enrichment.pbs` | GO over-representation analysis (BP/MF/CC) against the tested genes | `15_go_enrichment/` |
 
-The script `script/04_star_2pass_alignment.pbs` aligns trimmed files produced by `02_trimming_qc.pbs` in two passes.
+### Step details
 
-### Example execution
+**02 – trimming.** `config/trimming_config.txt` holds one line per BioProject:
+`BIOPROJECT TRIM_FRONT1 TRIM_FRONT2 MIN_PHRED N_BASE_LIMIT`. fastp also runs with
+`--unqualified_percent_limit 50` and, for paired-end reads, `--detect_adapter_for_pe`. Choose the 5′
+trimming from the FastQC per-base sequence content of step 01.
 
-```bash
-qsub script/04_star_2pass_alignment.pbs -i ../results/trimming_qc/trimmed -r ../results/star_index -o ../results/star_alignment -t 12
+**03 – contaminant screening.** Reads are aligned with HISAT2 to each genome in `CONTAMINANTS`
+(`name<TAB>source`, where source is an NCBI assembly accession or a FASTA path). Reads with a primary
+alignment to any contaminant are re-aligned to the host genome (`HOST_FA`). Those that do not align to
+the host are removed; reads that align to both are kept. For paired-end data the whole pair is
+removed. Output files keep the step-02 names, so later steps read `results/03_screening/clean` by
+default. To skip screening, set `READS_DIR=results/02_trimming/trimmed` in steps 05, 07 and 11.
+
+**05 – alignment.** Each sample gets two passes. Pass 1 finds splice junctions. Pass 2 re-aligns with
+that sample's junctions, using `--outSAMstrandField intronMotif` and the `NH HI AS nM XS` attributes
+that the assemblers need. Pass-1 `SJ.out.tab` files are also inputs to RTDmaker.
+
+**07 – RTD.** The step collects the assemblies, junction files and screened reads into flat input
+folders (RTDmaker's expected layout). It then runs RTDmaker ShortReads with
+`--SJ-reads 5 1 --tpm 0.5 1 --fragment-len 0.70 --antisense-len 0.50`; the environment variables
+`SJ_READS`, `TPM`, `FRAGMENT_LEN` and `ANTISENSE_LEN` change these thresholds. `OUTNAME` and `PREFIX`
+(default `RTD`) set the file names and the prefix of new gene and transcript IDs. Downstream steps use:
+
+- `<OUTNAME>.fixed.fa`: transcript sequences, input to BUSCO and TransDecoder
+- `<OUTNAME>.salmon_unique.fa`: transcripts with unique sequences, the Salmon index
+- `tx2gene.tsv`: `transcript_id → gene_id` from `<OUTNAME>.fixed.gtf`
+
+If you change `OUTNAME`, pass the new file names to steps 08, 09 and 11, and to every step that
+follows them.
+
+**13 – differential expression.** Each `metadata/<STUDY>.csv` is analysed on its own. Counts are
+imported with `tximport` (`countsFromAbundance = "lengthScaledTPM"`) and summarised to genes. The
+model is
+
+```
+~ [batch] + [time] + [genotype] + [cultivar] + condition + [time:condition] + [genotype:condition] + [cultivar:condition]
 ```
 
-### Supported options for `04_star_2pass_alignment.pbs`
+Each optional factor enters only if it has at least 2 levels. The step exports these results:
 
-- `-i INPUTDIR` : base folder for trimmed reads (default `../results/trimming_qc/trimmed`)
-- `-r STAR_INDEX` : STAR index directory (default `../results/star_index`)
-- `-o OUTDIR` : base folder for outputs (default `../results/star_alignment`)
-- `-t THREADS` : STAR thread count (default `12`)
-- `-s SJDB` : `sjdbOverhang` value (default `99`)
-- `-m RAM` : `limitBAMsortRAM` in bytes (default `110000000000`)
-- `-h` : show this help message
+- **Main contrast** `condition T vs C`, at the reference level of the other factors.
+- **Interaction coefficients**.
+- **One separate model per time point**, if the study has a `time` column:
+  `~ [batch] + [genotype] + [cultivar] + condition`, fitted on the samples of that time point.
 
-### Expected output
+Log2 fold changes are **maximum-likelihood estimates, not shrunken**. Their standard errors
+(`lfcSE`) are the within-study variances that the meta-analysis needs. Significance tables
+(`DE_sig_*`) use padj < 0.05 and |log2FC| ≥ 1.
 
-- `../results/star_alignment/pass1/` : STAR first-pass output
-- `../results/star_alignment/pass2/` : aligned BAMs from the second pass
-- `../results/star_alignment/logs/` : per-sample logs
+`contrasts.tsv` lists the tables that enter the meta-analysis: one per time point for studies with
+`time`, otherwise the main contrast. To use other levels than `C`/`T`, set `REF_LEVEL` and
+`TREAT_LEVEL`.
 
-## Assembly with Scallop and StringTie
+**14 – meta-analysis.** For each gene: `yi = log2FC`, `vi = lfcSE²` and
 
-The script `script/05_assembly.pbs` assembles transcripts from STAR pass2 BAMs. It supports Scallop, StringTie, or both in a single job.
-
-### Example execution
-
-```bash
-qsub script/05_assembly.pbs -b ../results/star_alignment/pass2 -o ../results/assembly -a both -g ../reference/annotations.gtf -t 12
+```r
+metafor::rma.mv(yi, vi, random = ~ 1 | study/contrast, method = "REML")
 ```
 
-### Supported options for `05_assembly.pbs`
-
-- `-b BAMDIR` : directory of STAR pass2 BAM files (default `../results/star_alignment/pass2`)
-- `-o OUTDIR` : base folder for assembly results (default `../results/assembly`)
-- `-a ASSEMBLERS` : `scallop`, `stringtie`, or `both` (default `both`)
-- `-g GTF` : reference GTF for StringTie (default `../reference/annotations.gtf`)
-- `-t THREADS` : threads for StringTie / samtools (default `8`)
-- `-f` : force rerun even if output already exists
-- `-h` : show this help message
-
-### Expected output
-
-- `../results/assembly/scallop/` : Scallop output GTFs
-- `../results/assembly/stringtie/` : StringTie output GTFs
-- `../results/assembly/logs/` : job logs
-
-## RTDmaker
-
-The script `script/06_rtdmaker.pbs` builds a Reference Transcriptome Database (RTD) using assembly GTFs, STAR SJ files, and cleaned FASTQ.
-
-### Example execution
-
-```bash
-qsub script/06_rtdmaker.pbs -a ../results/assembly -s ../results/star_alignment/pass1 -f ../results/trimming_qc/trimmed -r ../reference -g ../reference/genome.fa -t ../reference/annotations.gtf -o ../results/rtdmaker -n MyRTD -p MyPrefix -m 8
-```
-
-### Supported options for `06_rtdmaker.pbs`
-
-- `-a ASSEMBLY_DIR` : directory containing assembly GTFs (default `../results/assembly`)
-- `-l ASSEMBLY_LIST` : file listing paths to assembly GTFs (default: built automatically from `ASSEMBLY_DIR`)
-- `-s SJ_DIR` : directory containing `SJ.out.tab` files (default `../results/star_alignment/pass1`)
-- `-f FASTQ_DIR` : directory of cleaned FASTQ files (default `../results/trimming_qc/trimmed`)
-- `-r REFDIR` : reference folder (default `../reference`)
-- `-g GENOME_FA` : genome FASTA file (default `../reference/genome.fa`)
-- `-t REF_GTF` : reference GTF file for RTDmaker (default `../reference/annotations.gtf`)
-- `-o OUTDIR` : RTDmaker output directory (default `../results/rtdmaker`)
-- `-n OUTNAME` : RTD output name (default `Citrus_RTD`)
-- `-p PREFIX` : RTDmaker prefix (default `CitrusRTD`)
-- `-m RAM` : RAM in GB for RTDmaker (default `8`)
-- `-k KEEP` : keep level (`intermediary` by default)
-- `-h` : show this help message
-
-### Expected output
-
-- `../results/rtdmaker/` : full RTDmaker output
-- `../results/rtdmaker/input/assemblies/` : linked assembly GTFs
-- `../results/rtdmaker/reference_gtf/` : reference GTF for RTDmaker
-- `../results/rtdmaker/logs/` : job logs
-
-## BUSCO transcriptome
-
-The script `script/07_busco_transcriptome.pbs` assesses transcriptome completeness with BUSCO.
-
-### Example execution
-
-```bash
-qsub script/07_busco_transcriptome.pbs -i ../results/rtdmaker/Citrus_RTD.fa -d ../reference/eudicots_odb10 -o ../results/busco -n Citrus_RTD_busco -c 12
-```
-
-### Supported options for `07_busco_transcriptome.pbs`
-
-- `-i INPUT_FA` : input transcriptome FASTA (default `../results/rtdmaker/${OUTNAME}.fa`)
-- `-d DBDIR` : BUSCO lineage database directory (default `../reference/eudicots_odb10`)
-- `-m MODE` : BUSCO mode (default `transcriptome`)
-- `-o OUTDIR` : BUSCO output directory (default `../results/busco`)
-- `-n OUTNAME` : BUSCO run name (default `busco_transcriptome`)
-- `-c THREADS` : BUSCO thread count (default `12`)
-- `-h` : show this help message
-
-### Expected output
-
-- `../results/busco/<OUTNAME>/` : full BUSCO output
-
-## TransDecoder
-
-The script `script/08_transdecoder.pbs` predicts ORFs (Open Reading Frames) in the transcriptome using TransDecoder.
-
-### Example execution
-
-```bash
-qsub script/08_transdecoder.pbs -i ../results/rtdmaker/Citrus_RTD.fa -o ../results/transdecoder
-```
-
-### Supported options for `08_transdecoder.pbs`
-
-- `-i INPUT_FA` : input transcriptome FASTA (default `../results/rtdmaker/Citrus_RTD.fa`)
-- `-o OUTDIR` : TransDecoder output directory (default `../results/transdecoder`)
-- `-h` : show this help message
-
-### Expected output
-
-- `../results/transdecoder/` : full TransDecoder output (.pep, .cds, .gff3, etc.)
-
-## BUSCO peptides
-
-The script `script/09_busco_peptides.pbs` assesses the completeness of peptides predicted by TransDecoder using BUSCO.
-
-### Example execution
-
-```bash
-qsub script/09_busco_peptides.pbs -i ../results/transdecoder/Citrus_RTD.fa.transdecoder.pep -d ../reference/eudicots_odb10 -o ../results/busco_peptides -n Citrus_pep_busco -c 12
-```
-
-### Supported options for `09_busco_peptides.pbs`
-
-- `-i INPUT_PEP` : input peptide FASTA (default `../results/transdecoder/Citrus_RTD.fa.transdecoder.pep`)
-- `-d DBDIR` : BUSCO lineage database directory (default `../reference/eudicots_odb10`)
-- `-m MODE` : BUSCO mode (default `protein`)
-- `-o OUTDIR` : BUSCO output directory (default `../results/busco_peptides`)
-- `-n OUTNAME` : BUSCO run name (default `busco_peptides`)
-- `-c THREADS` : BUSCO thread count (default `12`)
-- `-h` : show this help message
-
-### Expected output
-
-- `../results/busco_peptides/<OUTNAME>/` : full BUSCO peptide output
-
-## Salmon quantification
-
-The script `script/10_salmon_quantification.pbs` builds the Salmon index and quantifies expression for each sample.
-
-### Example execution
-
-```bash
-qsub script/10_salmon_quantification.pbs -t ../results/rtdmaker/Citrus_RTD.fa -s salmon_samples.tsv -i ../results/salmon/index -o ../results/salmon/quants -p 12
-```
-
-### Supported options for `10_salmon_quantification.pbs`
-
-- `-t TRANSCRIPTOME_FA` : transcriptome FASTA for indexing (default `../results/rtdmaker/Citrus_RTD.fa`)
-- `-s SAMPLES_TSV` : TSV file with sample info: sample_id\tr1\tr2 (default `salmon_samples.tsv`)
-- `-i INDEX_DIR` : Salmon index output directory (default `../results/salmon/index`)
-- `-o QUANTDIR` : quantification output directory (default `../results/salmon/quants`)
-- `-m MAP_FILE` : TSV file mapping sample to quant directory (default `../results/salmon/sample_to_quantdir.tsv`)
-- `-p THREADS` : Salmon threads (default `12`)
-- `-f` : force rerun even if output exists
-- `-h` : show this help message
-
-### Expected output
-
-- `../results/salmon/index/` : Salmon index
-- `../results/salmon/quants/<sample>/` : per-sample quantifications (`quant.sf`)
-- `../results/salmon/sample_to_quantdir.tsv` : sample-to-quant directory mapping
-
-### Samples TSV format
-
-The file `salmon_samples.tsv` should have a header and TSV rows:
-
-```tsv
-sample_id	r1	r2
-sample1	/path/to/sample1_R1.fastq.gz	/path/to/sample1_R2.fastq.gz
-sample2	/path/to/sample2_R1.fastq.gz	/path/to/sample2_R2.fastq.gz
-```
-
-## InterProScan annotation
-
-The script `script/11_interproscan.pbs` annotates predicted peptides with InterProScan using multiple databases.
-
-### Example execution
-
-```bash
-qsub script/11_interproscan.pbs -i ../results/transdecoder/Citrus_RTD.fa.transdecoder.pep -o ../results/interproscan -c 12
-```
-
-### Supported options for `11_interproscan.pbs`
-
-- `-i INPUT_PEP` : input peptide FASTA (default `../results/transdecoder/Citrus_RTD.fa.transdecoder.pep`)
-- `-o OUTDIR` : InterProScan output directory (default `../results/interproscan`)
-- `-t TMPDIR` : temporary directory (default `../results/interproscan/tmp`)
-- `-c THREADS` : CPU threads (default `12`)
-- `-f FORMATS` : output formats: TSV,XML,GFF3 (default `TSV,XML,GFF3`)
-- `-h` : show this help message
-
-### Expected output
-
-- `../results/interproscan/` : InterProScan output in TSV, XML, GFF3 formats
-
-## DESeq2 analysis
-
-The script `script/12_deseq_analysis.pbs` performs differential expression analysis using DESeq2 on Salmon data.
-
-### Example execution
-
-```bash
-qsub script/12_deseq_analysis.pbs -m ../metadata -q ../results/salmon/quants -t ../results/rtdmaker/tx2gene.tsv -o ../results/deseq
-```
-
-### Supported options for `12_deseq_analysis.pbs`
-
-- `-m METADATA_DIR` : directory with metadata CSV files (default `../metadata`)
-- `-q QUANTS_DIR` : directory with Salmon quantifications (default `../results/salmon/quants`)
-- `-t TX2GENE` : tx2gene TSV file (default `../results/rtdmaker/tx2gene.tsv`)
-- `-o OUTDIR` : DESeq2 output directory (default `../results/deseq`)
-- `-r RSCRIPT` : path to Rscript (default `Rscript`)
-- `-h` : show this help message
-
-### Metadata CSV format
-
-CSV files in `metadata/` should have columns such as:
-
-```csv
-sample,condition,time,genotype,batch
-sample1,C,0,WT,1
-sample2,T,0,WT,1
-sample3,C,24,WT,2
-sample4,T,24,WT,2
-```
-
-### Expected output
-
-- `../results/deseq/<dataset>/results/` : DESeq2 results for each contrast (CSV, RDS)
-- `../results/deseq/<dataset>/figures/` : MA plots for each contrast
-
-## Trimming configuration example
-
-The `trimming_config.txt` file should contain lines with the following fields separated by spaces:
-
-```text
-BIOPROJECT TRIM1 TRIM2 PHRED NLIMIT
-```
-
-Example:
-
-```text
-PRJ001 10 10 20 5
-PRJ002 5 5 20 5
-```
-
-Lines starting with `#` are ignored.
-
-
-
-If using a module system or Conda environment, activate it before submitting jobs.
-
+Contrasts (for example, time points) are nested within studies. A gene is tested only when it has at
+least 3 contrasts from at least 2 studies (`MIN_CONTRASTS`, `MIN_STUDIES`). P-values are corrected by
+Benjamini–Hochberg over the genes tested. Significant genes have FDR < 0.05 and |estimate| ≥ 1
+(`FDR_CUT`, `LFC_CUT`). The output also has between-study and within-study heterogeneity
+(`tau2_study`, `tau2_contrast`) and Cochran's Q.
+
+With `STUDY_GROUPS=<file>` (a `study<TAB>group` table; see `config/example_study_groups.tsv`), each
+group is meta-analysed separately. Use one group for each biological question that can be compared.
+Do not pool unrelated treatments in one model in order to compare them; compare the results of
+separate groups instead.
+
+**15 – GO enrichment.** GO terms come from the InterProScan output. They pass from each peptide to
+its transcript, then to its gene. The test is an over-representation test (`clusterProfiler::enricher`,
+BH correction, terms with 06–500 genes, q < 0.2). It runs separately for BP, MF and CC. The universe
+is the **genes actually tested** in the analysis that produced the set, limited to annotated genes;
+sets with fewer than 5 annotated genes are not tested. By default the sets are the UP and DOWN genes
+of each group from step 14. For other sets (a single study, or the overlap between groups with the
+intersection of their tested genes as universe), list them in your own `SETS` table with the columns
+`set genes_file universe_file`.
+
+## Software
+
+Versions used for the reference run:
+
+| Tool | Version | | Tool | Version |
+|---|---|---|---|---|
+| FastQC | 0.11.9 | | RTDmaker | 1.0.0 |
+| MultiQC | 1.11 | | BUSCO | 6.0.0 |
+| fastp | 1.0.1 | | TransDecoder | 5.5.0 |
+| STAR | 2.7.8a | | Salmon | 1.9.0 |
+| Scallop | 0.10.5 | | InterProScan | 5.68-100.0 |
+| StringTie | 2.2.1 | | R (step 13, cluster) | 4.4.1 |
+| samtools | 1.13 | | HISAT2 | 2.2.1 |
+| seqtk | 1.2-r95 | | NCBI datasets | 16.6.0 |
+
+R packages: `tximport`, `DESeq2`, `ggplot2` (step 13); `metafor` (step 14); `clusterProfiler`,
+`GO.db`, `AnnotationDbi` (step 15). The reference run used R 4.3.1 / Bioconductor 3.18 for steps 14–15
+(metafor 4.8.0, clusterProfiler 4.10.1, GO.db 3.18.0, AnnotationDbi 1.64.1). Steps 13–15 write `sessionInfo.txt` with the exact package
+versions of each run. RTDmaker is installed from <https://github.com/anonconda/RTDmaker>;
+`RTDmaker.py` must be in `PATH`, or its folder set in `RTDMAKER_PREFIX`.
+
+## License
+
+See [LICENSE](LICENSE).

@@ -1,0 +1,5 @@
+# Contaminant genomes screened in step 03 (host: Citrus sinensis GCF_022201045.2, given as HOST_FA)
+# name	source
+phix	GCF_000819615.1
+yeast	GCF_000146045.2
+ecoli	GCF_000005845.2

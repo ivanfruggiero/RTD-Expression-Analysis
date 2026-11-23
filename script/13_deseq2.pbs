@@ -1,0 +1,72 @@
+#!/bin/bash
+#PBS -N 13_deseq2
+#PBS -l select=1:ncpus=8:mem=64gb
+#PBS -l walltime=72:00:00
+#PBS -j oe
+#PBS -o logs/13_deseq2.log
+
+# Step 13 - Gene-level differential expression, one DESeq2 analysis per study.
+# Every *.csv in METADATA_DIR is one study (study name = file name). See script/R/deseq2_per_study.R
+# for the model and the output files, and metadata/README.md for the metadata format.
+# Output: OUTDIR/<study>/{results,figures}/, OUTDIR/<study>/contrasts.tsv, OUTDIR/contrasts.tsv (all studies)
+
+set -euo pipefail
+source "${PBS_O_WORKDIR:-$PWD}/script/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: qsub [-v METADATA_DIR=...,REF_LEVEL=C,TREAT_LEVEL=T] script/13_deseq2.pbs
+   or: bash script/13_deseq2.pbs [-m METADATA_DIR] [-q QUANTS] [-t TX2GENE] [-o OUTDIR] [-c REF_LEVEL] [-x TREAT_LEVEL]
+  -m METADATA_DIR  one CSV per study           (default: metadata)
+  -q QUANTS        Salmon quants from step 11  (default: results/11_salmon/quants)
+  -t TX2GENE       tx2gene from step 07        (default: results/07_rtdmaker/tx2gene.tsv)
+  -o OUTDIR        output directory            (default: results/13_deseq2)
+  -c REF_LEVEL     control level of 'condition'   (default: C)
+  -x TREAT_LEVEL   treated level of 'condition'   (default: T)
+  RSCRIPT          Rscript executable (env only, default: Rscript)
+USAGE
+}
+
+METADATA_DIR=${METADATA_DIR:-metadata}
+QUANTS=${QUANTS:-results/11_salmon/quants}
+TX2GENE=${TX2GENE:-results/07_rtdmaker/tx2gene.tsv}
+OUTDIR=${OUTDIR:-results/13_deseq2}
+REF_LEVEL=${REF_LEVEL:-C}
+TREAT_LEVEL=${TREAT_LEVEL:-T}
+RSCRIPT=${RSCRIPT:-Rscript}
+
+while getopts ":m:q:t:o:c:x:h" opt; do
+  case $opt in
+    m) METADATA_DIR=$OPTARG ;; q) QUANTS=$OPTARG ;; t) TX2GENE=$OPTARG ;; o) OUTDIR=$OPTARG ;;
+    c) REF_LEVEL=$OPTARG ;; x) TREAT_LEVEL=$OPTARG ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+setup_env
+require_cmd "$RSCRIPT"
+require_dir "$METADATA_DIR"; require_dir "$QUANTS"; require_file "$TX2GENE"
+mkdir -p "$OUTDIR"
+
+n=0; failed=""
+printf 'study\tcontrast\tfile\n' > "$OUTDIR/contrasts.tsv"
+while read -r META; do
+  STUDY=$(basename "$META" .csv)
+  case "$STUDY" in example_*) log "[SKIP] example file $META"; continue ;; esac
+  log "=== $STUDY"
+  mkdir -p "$OUTDIR/$STUDY"
+  if "$RSCRIPT" script/R/deseq2_per_study.R "$META" "$QUANTS" "$TX2GENE" "$OUTDIR/$STUDY" "$REF_LEVEL" "$TREAT_LEVEL" \
+       > "$OUTDIR/$STUDY/deseq2.log" 2>&1 < /dev/null; then
+    tail -n +2 "$OUTDIR/$STUDY/contrasts.tsv" >> "$OUTDIR/contrasts.tsv"
+    grep '^\[OK\]' "$OUTDIR/$STUDY/deseq2.log" || true
+    n=$((n + 1))
+  else
+    warn "$STUDY failed, see $OUTDIR/$STUDY/deseq2.log"; failed="$failed $STUDY"
+  fi
+done < <(find "$METADATA_DIR" -maxdepth 1 -type f -name '*.csv' | sort)
+
+[ -z "$failed" ] || die "failed studies:$failed"
+[ "$n" -gt 0 ] || die "no study metadata (*.csv, not example_*) in $METADATA_DIR"
+log "Done: $n stud(ies); contrast index for step 14: $OUTDIR/contrasts.tsv"

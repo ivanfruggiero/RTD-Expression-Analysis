@@ -1,0 +1,52 @@
+#!/bin/bash
+#PBS -N 10_busco_peptides
+#PBS -l select=1:ncpus=12:mem=64gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o logs/10_busco_peptides.log
+
+# Step 10 - BUSCO completeness of the peptides predicted by TransDecoder (step 09).
+
+set -euo pipefail
+source "${PBS_O_WORKDIR:-$PWD}/script/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: qsub -v LINEAGE=...[,INPUT=...] script/10_busco_peptides.pbs
+   or: bash script/10_busco_peptides.pbs -l LINEAGE [-i INPUT] [-m MODE] [-o OUTDIR] [-n RUN_NAME] [-c THREADS]
+  -l LINEAGE   BUSCO lineage dataset, directory or name (e.g. embryophyta_odb10)   (required)
+  -i INPUT     peptide FASTA   (default: results/09_transdecoder/RTD.fixed.fa.transdecoder.pep)
+  -m MODE      BUSCO mode      (default: protein)
+  -o OUTDIR    output dir      (default: results/10_busco_peptides)
+  -n RUN_NAME  run name        (default: busco_protein)
+  -c THREADS   threads         (default: NCPUS or 12)
+An existing run with the same name is overwritten.
+USAGE
+}
+
+INPUT=${INPUT:-results/09_transdecoder/RTD.fixed.fa.transdecoder.pep}
+LINEAGE=${LINEAGE:-}
+MODE=${MODE:-protein}
+OUTDIR=${OUTDIR:-results/10_busco_peptides}
+RUN_NAME=${RUN_NAME:-busco_protein}
+THREADS=${THREADS:-$(ncpus 12)}
+
+while getopts ":i:l:m:o:n:c:h" opt; do
+  case $opt in
+    i) INPUT=$OPTARG ;; l) LINEAGE=$OPTARG ;; m) MODE=$OPTARG ;;
+    o) OUTDIR=$OPTARG ;; n) RUN_NAME=$OPTARG ;; c) THREADS=$OPTARG ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+setup_env
+require_cmd busco
+require_file "$INPUT"
+[ -n "$LINEAGE" ] || die "set LINEAGE (BUSCO lineage dataset), e.g. -l embryophyta_odb10"
+mkdir -p "$OUTDIR"
+
+log "$(busco --version) | INPUT=$INPUT LINEAGE=$LINEAGE MODE=$MODE OUT=$OUTDIR/$RUN_NAME"
+busco -i "$INPUT" -l "$LINEAGE" -m "$MODE" -o "$RUN_NAME" --out_path "$OUTDIR" -c "$THREADS" -f
+log "Done: $OUTDIR/$RUN_NAME (short_summary*.txt)"

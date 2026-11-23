@@ -1,0 +1,7 @@
+# Per-BioProject fastp parameters, whitespace separated. Lines starting with # are ignored.
+# BIOPROJECT  TRIM_FRONT1  TRIM_FRONT2  MIN_PHRED  N_BASE_LIMIT
+# TRIM_FRONT1/2: bases removed from the 5' end of read 1 / read 2 (choose from the FastQC per-base
+#   sequence content of step 01; for single-end data TRIM_FRONT2 is ignored)
+# MIN_PHRED: --qualified_quality_phred ; N_BASE_LIMIT: --n_base_limit
+PRJNA000001  10  10  20  15
+PRJNA000002  10  10  20  15

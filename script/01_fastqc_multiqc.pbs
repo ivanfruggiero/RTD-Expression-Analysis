@@ -1,41 +1,57 @@
 #!/bin/bash
-#PBS -N fastqc_multiqc
+#PBS -N 01_fastqc_multiqc
 #PBS -l select=1:ncpus=4:mem=16gb
-#PBS -l walltime=4:00:00
-#PBS -q standard
+#PBS -l walltime=12:00:00
 #PBS -j oe
-#PBS -o ../logs/fastqc_multiqc.log
-#PBS -m abe
-#PBS -M user@example.com
+#PBS -o logs/01_fastqc_multiqc.log
+
+# Step 01 - Quality control of raw reads (FastQC + MultiQC).
+# Input layout: RAW_BASE/{paired,single}/<BIOPROJECT>/*.fastq.gz
 
 set -euo pipefail
+source "${PBS_O_WORKDIR:-$PWD}/script/common.sh"
 
-# Definizione variabili neutre per riproducibilità
-WORKDIR=$PBS_O_WORKDIR
-RAWDIR=../raw_reads
-RESULTDIR=../results/fastqc
-LOGDIR=../logs
+usage() {
+  cat <<'USAGE'
+Usage: qsub -v RAW_BASE=...,OUTDIR=...,THREADS=... script/01_fastqc_multiqc.pbs
+   or: bash script/01_fastqc_multiqc.pbs [-i RAW_BASE] [-o OUTDIR] [-t THREADS]
+  -i RAW_BASE  base directory of raw reads   (default: raw_reads)
+  -o OUTDIR    output directory               (default: results/01_fastqc_raw)
+  -t THREADS   FastQC threads                 (default: NCPUS or 4)
+USAGE
+}
 
-cd $WORKDIR
-mkdir -p $RESULTDIR
-mkdir -p $LOGDIR
+RAW_BASE=${RAW_BASE:-raw_reads}
+OUTDIR=${OUTDIR:-results/01_fastqc_raw}
+THREADS=${THREADS:-$(ncpus 4)}
 
-source /etc/profile.d/modules.sh
-
-# Load modules
-module purge
-module load fastqc/0.11.9
-module load multiqc/1.11
-
-echo "Running FastQC on all .fastq.gz files in $RAWDIR..."
-for file in $RAWDIR/*.fastq.gz; do
-    if [ -f "$file" ]; then
-        echo "Processing $file..."
-        fastqc -o $RESULTDIR "$file"
-    fi
+while getopts ":i:o:t:h" opt; do
+  case $opt in
+    i) RAW_BASE=$OPTARG ;; o) OUTDIR=$OPTARG ;; t) THREADS=$OPTARG ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
 done
 
-echo "Running MultiQC on FastQC results..."
-multiqc -o $RESULTDIR $RESULTDIR
+setup_env
+require_cmd fastqc multiqc
+require_dir "$RAW_BASE"
 
-echo "FastQC and MultiQC analysis completed on $(date)"
+FILELIST=$(mktemp)
+trap 'rm -f "$FILELIST"' EXIT
+find "$RAW_BASE"/paired "$RAW_BASE"/single -mindepth 2 -maxdepth 2 -type f -name '*.fastq.gz' 2>/dev/null | sort > "$FILELIST" || true
+[ -s "$FILELIST" ] || die "no *.fastq.gz found under $RAW_BASE/{paired,single}/<BIOPROJECT>/"
+
+log "FastQC on $(wc -l < "$FILELIST" | tr -d ' ') files (threads: $THREADS)"
+while read -r f; do
+  layout=$(basename "$(dirname "$(dirname "$f")")")
+  bp=$(basename "$(dirname "$f")")
+  out="$OUTDIR/fastqc/$layout/$bp"
+  mkdir -p "$out"
+  fastqc --threads "$THREADS" -o "$out" "$f"
+done < "$FILELIST"
+
+log "MultiQC"
+multiqc -f -o "$OUTDIR/multiqc" "$OUTDIR/fastqc"
+log "Done: $OUTDIR"

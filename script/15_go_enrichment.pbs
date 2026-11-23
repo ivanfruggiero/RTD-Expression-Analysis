@@ -1,0 +1,55 @@
+#!/bin/bash
+#PBS -N 15_go_enrichment
+#PBS -l select=1:ncpus=2:mem=16gb
+#PBS -l walltime=12:00:00
+#PBS -j oe
+#PBS -o logs/15_go_enrichment.log
+
+# Step 15 - GO over-representation analysis (BP, MF, CC) of gene sets, each tested against the
+# genes that were actually tested in the analysis that produced it. GO terms come from
+# InterProScan (step 12). Details: script/R/go_enrichment.R.
+# By default the sets are the UP/DOWN genes of every meta-analysis group (step 14); any other set
+# (e.g. genes of a single study, or overlaps between groups with the intersection of their tested
+# genes as universe) can be added to a custom SETS sheet.
+
+set -euo pipefail
+source "${PBS_O_WORKDIR:-$PWD}/script/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: qsub [-v SETS=...] script/15_go_enrichment.pbs
+   or: bash script/15_go_enrichment.pbs [-a IPS_TSV] [-t TX2GENE] [-s SETS] [-o OUTDIR]
+  -a IPS_TSV  InterProScan TSV (step 12)  (default: results/12_interproscan/RTD.fixed.fa.transdecoder.noStop.tsv)
+  -t TX2GENE  tx2gene (step 07)           (default: results/07_rtdmaker/tx2gene.tsv)
+  -s SETS     set <TAB> genes_file <TAB> universe_file  (default: results/14_meta_analysis/enrichment_sets.tsv)
+  -o OUTDIR   output directory            (default: results/15_go_enrichment)
+GENE2GO (env)  precomputed gene<TAB>GO table, used instead of IPS_TSV + TX2GENE
+Thresholds (env): MIN_GS=5 MAX_GS=500 P_CUT=0.05 Q_CUT=0.2; RSCRIPT=Rscript
+USAGE
+}
+
+IPS_TSV=${IPS_TSV:-results/12_interproscan/RTD.fixed.fa.transdecoder.noStop.tsv}
+TX2GENE=${TX2GENE:-results/07_rtdmaker/tx2gene.tsv}
+SETS=${SETS:-results/14_meta_analysis/enrichment_sets.tsv}
+OUTDIR=${OUTDIR:-results/15_go_enrichment}
+RSCRIPT=${RSCRIPT:-Rscript}
+
+while getopts ":a:t:s:o:h" opt; do
+  case $opt in
+    a) IPS_TSV=$OPTARG ;; t) TX2GENE=$OPTARG ;; s) SETS=$OPTARG ;; o) OUTDIR=$OPTARG ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+setup_env
+require_cmd "$RSCRIPT"
+require_file "$SETS"
+if [ -n "${GENE2GO:-}" ]; then require_file "$GENE2GO"; export GENE2GO
+else require_file "$IPS_TSV"; require_file "$TX2GENE"; fi
+mkdir -p "$OUTDIR"
+
+log "IPS=$IPS_TSV TX2GENE=$TX2GENE GENE2GO=${GENE2GO:-<from InterProScan>} SETS=$SETS OUTDIR=$OUTDIR"
+"$RSCRIPT" script/R/go_enrichment.R "$IPS_TSV" "$TX2GENE" "$SETS" "$OUTDIR"
+log "Done: $OUTDIR/enrichment_summary.tsv, $OUTDIR/enrichment_terms.tsv"

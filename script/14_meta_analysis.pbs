@@ -1,0 +1,62 @@
+#!/bin/bash
+#PBS -N 14_meta_analysis
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o logs/14_meta_analysis.log
+
+# Step 14 - Gene-wise multilevel meta-analysis across studies (metafor::rma.mv,
+# random = ~ 1 | study/contrast). Model, filters and outputs: see script/R/meta_multilevel.R.
+# Output: OUTDIR/<group>/{master_table,meta_results,meta_sig}.tsv + gene lists for step 15
+
+set -euo pipefail
+source "${PBS_O_WORKDIR:-$PWD}/script/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: qsub [-v STUDY_GROUPS=config/study_groups.tsv] script/14_meta_analysis.pbs
+   or: bash script/14_meta_analysis.pbs [-i CONTRASTS] [-g STUDY_GROUPS] [-o OUTDIR] [-t THREADS]
+  -i CONTRASTS  contrast index from step 13   (default: results/13_deseq2/contrasts.tsv)
+  -g STUDY_GROUPS optional study <TAB> group file; studies are meta-analysed within each group
+                 (default: none = all studies together)
+  -o OUTDIR     output directory              (default: results/14_meta_analysis)
+  -t THREADS    parallel workers              (default: NCPUS or 8)
+Thresholds (env): MIN_CONTRASTS=3 MIN_STUDIES=2 FDR_CUT=0.05 LFC_CUT=1; RSCRIPT=Rscript
+USAGE
+}
+
+CONTRASTS=${CONTRASTS:-results/13_deseq2/contrasts.tsv}
+STUDY_GROUPS=${STUDY_GROUPS:-}
+OUTDIR=${OUTDIR:-results/14_meta_analysis}
+THREADS=${THREADS:-$(ncpus 8)}
+RSCRIPT=${RSCRIPT:-Rscript}
+
+while getopts ":i:g:o:t:h" opt; do
+  case $opt in
+    i) CONTRASTS=$OPTARG ;; g) STUDY_GROUPS=$OPTARG ;; o) OUTDIR=$OPTARG ;; t) THREADS=$OPTARG ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+setup_env
+require_cmd "$RSCRIPT"
+require_file "$CONTRASTS"
+[ -z "$STUDY_GROUPS" ] || require_file "$STUDY_GROUPS"
+mkdir -p "$OUTDIR"
+
+log "CONTRASTS=$CONTRASTS GROUPS=${STUDY_GROUPS:-<none>} OUTDIR=$OUTDIR THREADS=$THREADS"
+"$RSCRIPT" script/R/meta_multilevel.R "$CONTRASTS" "$OUTDIR" "$STUDY_GROUPS" "$THREADS"
+
+# Gene-set sheet for step 15: UP and DOWN genes of each group against that group's tested genes.
+SHEET="$OUTDIR/enrichment_sets.tsv"
+printf 'set\tgenes_file\tuniverse_file\n' > "$SHEET"
+for d in "$OUTDIR"/*/; do
+  g=$(basename "$d")
+  [ -f "$d/genes_tested.txt" ] || continue
+  for dir in UP DOWN; do
+    printf '%s_%s\t%s\t%s\n' "$g" "$dir" "${d}genes_${dir}.txt" "${d}genes_tested.txt" >> "$SHEET"
+  done
+done
+log "Done: $OUTDIR (gene-set sheet for step 15: $SHEET)"

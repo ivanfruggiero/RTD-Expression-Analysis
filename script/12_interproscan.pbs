@@ -1,0 +1,55 @@
+#!/bin/bash
+#PBS -N 12_interproscan
+#PBS -l select=1:ncpus=16:mem=64gb
+#PBS -l walltime=240:00:00
+#PBS -j oe
+#PBS -o logs/12_interproscan.log
+
+# Step 12 - Functional annotation of the predicted peptides with InterProScan
+# (member databases installed locally, GO terms and InterPro look-up).
+# TransDecoder marks stop codons with '*', which InterProScan rejects: they are removed first.
+# Output: OUTDIR/<name>.noStop.{tsv,xml,gff3}
+
+set -euo pipefail
+source "${PBS_O_WORKDIR:-$PWD}/script/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: qsub [-v INPUT_PEP=...] script/12_interproscan.pbs
+   or: bash script/12_interproscan.pbs [-i INPUT_PEP] [-o OUTDIR] [-c THREADS] [-f FORMATS]
+  -i INPUT_PEP  peptides from step 09  (default: results/09_transdecoder/RTD.fixed.fa.transdecoder.pep)
+  -o OUTDIR     output directory       (default: results/12_interproscan)
+  -c THREADS    CPUs                   (default: NCPUS or 16)
+  -f FORMATS    output formats         (default: TSV,XML,GFF3)
+USAGE
+}
+
+INPUT_PEP=${INPUT_PEP:-results/09_transdecoder/RTD.fixed.fa.transdecoder.pep}
+OUTDIR=${OUTDIR:-results/12_interproscan}
+THREADS=${THREADS:-$(ncpus 16)}
+FORMATS=${FORMATS:-TSV,XML,GFF3}
+
+while getopts ":i:o:c:f:h" opt; do
+  case $opt in
+    i) INPUT_PEP=$OPTARG ;; o) OUTDIR=$OPTARG ;; c) THREADS=$OPTARG ;; f) FORMATS=$OPTARG ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+setup_env
+require_cmd interproscan.sh
+require_file "$INPUT_PEP"
+IPS_TMP="$OUTDIR/tmp"
+mkdir -p "$OUTDIR" "$IPS_TMP"
+
+BASE="$OUTDIR/$(basename "$INPUT_PEP" .pep).noStop"
+sed '/^>/! s/\*//g' "$INPUT_PEP" > "$BASE.pep"
+log "Input: $BASE.pep ($(grep -c '^>' "$BASE.pep") sequences)"
+interproscan.sh --version 2>/dev/null | head -3 || true
+
+interproscan.sh -i "$BASE.pep" -f "$FORMATS" -dp -goterms -iprlookup \
+  --cpu "$THREADS" --tempdir "$IPS_TMP" -b "$BASE"
+
+log "Done: $BASE.tsv"

@@ -1,5 +1,13 @@
 sample,condition,time
-sample1,C,0
-sample2,C,24
-sample3,T,0
-sample4,T,24
+SRR0000011,C,early
+SRR0000012,C,early
+SRR0000013,C,early
+SRR0000014,T,early
+SRR0000015,T,early
+SRR0000016,T,early
+SRR0000017,C,late
+SRR0000018,C,late
+SRR0000019,C,late
+SRR0000020,T,late
+SRR0000021,T,late
+SRR0000022,T,late

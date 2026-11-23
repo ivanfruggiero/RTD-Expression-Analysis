@@ -1,0 +1,158 @@
+#!/bin/bash
+#PBS -N 07_rtdmaker
+#PBS -l select=1:ncpus=12:mem=64gb
+#PBS -l walltime=72:00:00
+#PBS -j oe
+#PBS -o logs/07_rtdmaker.log
+
+# Step 07 - Build the Reference Transcript Dataset (RTD) with RTDmaker ShortReads, then derive
+# the transcript-to-gene table used by DESeq2 (step 13) and GO annotation (step 15).
+#
+# RTDmaker reads flat directories, so the step stages symlinks first:
+#   OUTDIR/input/assemblies/  all *.gtf from step 06
+#   OUTDIR/input/sj/          all pass-1 SJ.out.tab from step 05
+#   OUTDIR/input/fastq/       reads (step 03) as <ID>_R1/_R2.fastq.gz (paired) or <ID>.fastq.gz
+#   OUTDIR/input/reference/   the reference GTF(s)
+# RTDmaker output: OUTDIR/<OUTNAME>_RTDmaker_output/<OUTNAME>.{gtf,fixed.gtf,fixed.fa,salmon_unique.fa,...}
+# Extra output:    OUTDIR/tx2gene.tsv  (transcript_id <TAB> gene_id, no header)
+
+set -euo pipefail
+source "${PBS_O_WORKDIR:-$PWD}/script/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: qsub -v GENOME_FA=...,REF_GTF=...,OUTNAME=... script/07_rtdmaker.pbs
+   or: bash script/07_rtdmaker.pbs [options]
+  -a ASSEMBLY_DIR  assemblies from step 06             (default: results/06_assembly)
+  -l ASSEMBLY_LIST optional file with one GTF path per line (overrides -a)
+  -s SJ_DIR        STAR pass-1 junctions from step 05  (default: results/05_star/pass1)
+  -q READS_DIR     reads from step 03 (or 02)          (default: results/03_screening/clean)
+  -g GENOME_FA     genome FASTA                        (default: reference/genome.fa)
+  -t REF_GTF       reference annotation GTF(s); several files separated by spaces are all
+                   given to RTDmaker as references   (default: reference/annotation.gtf)
+  -o OUTDIR        output directory                    (default: results/07_rtdmaker)
+  -n OUTNAME       RTD name                            (default: RTD)
+  -p PREFIX        prefix of new gene/transcript IDs   (default: RTD)
+  -m RAM           RAM for RTDmaker, GB                (default: 8)
+  -k KEEP          RTDmaker --keep                     (default: intermediary)
+RTDmaker filtering thresholds can be changed with SJ_READS, TPM, FRAGMENT_LEN, ANTISENSE_LEN
+(defaults: "5 1", "0.5 1", 0.70, 0.50). RTDmaker.py is searched in PATH or in RTDMAKER_PREFIX.
+USAGE
+}
+
+ASSEMBLY_DIR=${ASSEMBLY_DIR:-results/06_assembly}
+ASSEMBLY_LIST=${ASSEMBLY_LIST:-}
+SJ_DIR=${SJ_DIR:-results/05_star/pass1}
+READS_DIR=${READS_DIR:-results/03_screening/clean}
+GENOME_FA=${GENOME_FA:-reference/genome.fa}
+REF_GTF=${REF_GTF:-reference/annotation.gtf}
+OUTDIR=${OUTDIR:-results/07_rtdmaker}
+OUTNAME=${OUTNAME:-RTD}
+PREFIX=${PREFIX:-RTD}
+RAM=${RAM:-8}
+KEEP=${KEEP:-intermediary}
+SJ_READS=${SJ_READS:-5 1}
+TPM=${TPM:-0.5 1}
+FRAGMENT_LEN=${FRAGMENT_LEN:-0.70}
+ANTISENSE_LEN=${ANTISENSE_LEN:-0.50}
+
+while getopts ":a:l:s:q:g:t:o:n:p:m:k:h" opt; do
+  case $opt in
+    a) ASSEMBLY_DIR=$OPTARG ;; l) ASSEMBLY_LIST=$OPTARG ;; s) SJ_DIR=$OPTARG ;;
+    q) READS_DIR=$OPTARG ;; g) GENOME_FA=$OPTARG ;; t) REF_GTF=$OPTARG ;;
+    o) OUTDIR=$OPTARG ;; n) OUTNAME=$OPTARG ;; p) PREFIX=$OPTARG ;;
+    m) RAM=$OPTARG ;; k) KEEP=$OPTARG ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+setup_env
+require_cmd python
+RTDMAKER=$(command -v RTDmaker.py || true)
+if [ -z "$RTDMAKER" ] && [ -n "${RTDMAKER_PREFIX:-}" ] && [ -f "$RTDMAKER_PREFIX/RTDmaker.py" ]; then
+  RTDMAKER="$RTDMAKER_PREFIX/RTDmaker.py"
+fi
+[ -n "$RTDMAKER" ] || die "RTDmaker.py not found: add it to PATH or set RTDMAKER_PREFIX"
+require_file "$GENOME_FA"
+for g in $REF_GTF; do require_file "$g"; done
+require_dir "$SJ_DIR"; require_dir "$READS_DIR"
+
+abspath() { (cd "$(dirname "$1")" && echo "$(pwd -P)/$(basename "$1")"); }
+
+IN="$OUTDIR/input"
+rm -rf "$IN"; mkdir -p "$IN/assemblies" "$IN/sj" "$IN/fastq" "$IN/reference"
+
+# Assemblies
+if [ -n "$ASSEMBLY_LIST" ]; then
+  require_file "$ASSEMBLY_LIST"; grep -v '^[[:space:]]*$' "$ASSEMBLY_LIST" > "$IN/assemblies.list"
+else
+  require_dir "$ASSEMBLY_DIR"
+  find "$ASSEMBLY_DIR" -type f -name '*.gtf' | sort > "$IN/assemblies.list"
+fi
+while read -r f; do
+  [ -s "$f" ] || { warn "assembly missing/empty: $f"; continue; }
+  [ ! -e "$IN/assemblies/$(basename "$f")" ] || die "two assemblies share the name $(basename "$f")"
+  ln -s "$(abspath "$f")" "$IN/assemblies/$(basename "$f")"
+done < "$IN/assemblies.list"
+
+# Splice junctions
+find "$SJ_DIR" -maxdepth 1 -type f -name '*SJ.out.tab' | sort | while read -r f; do
+  ln -s "$(abspath "$f")" "$IN/sj/$(basename "$f")"
+done
+
+# Trimmed reads (flat, unique names)
+while IFS=$'\t' read -r BP S R1 R2; do
+  if [ -n "$R2" ]; then
+    ln -s "$(abspath "$R1")" "$IN/fastq/${BP}_${S}_R1.fastq.gz"
+    ln -s "$(abspath "$R2")" "$IN/fastq/${BP}_${S}_R2.fastq.gz"
+  else
+    ln -s "$(abspath "$R1")" "$IN/fastq/${BP}_${S}.fastq.gz"
+  fi
+done < <(list_trimmed_samples "$READS_DIR")
+
+for g in $REF_GTF; do ln -s "$(abspath "$g")" "$IN/reference/$(basename "$g")"; done
+
+N_ASM=$(find "$IN/assemblies" -name '*.gtf' | wc -l | tr -d ' ')
+N_SJ=$(find "$IN/sj" -name '*SJ.out.tab' | wc -l | tr -d ' ')
+N_FQ=$(find "$IN/fastq" -name '*.fastq.gz' | wc -l | tr -d ' ')
+[ "$N_ASM" -gt 0 ] || die "no assembly GTF staged"
+[ "$N_SJ" -gt 0 ]  || die "no SJ.out.tab staged from $SJ_DIR"
+[ "$N_FQ" -gt 0 ]  || die "no FASTQ staged from $READS_DIR"
+log "RTDmaker=$RTDMAKER | assemblies=$N_ASM SJ files=$N_SJ FASTQ files=$N_FQ OUTNAME=$OUTNAME PREFIX=$PREFIX"
+
+# shellcheck disable=SC2086
+python "$RTDMAKER" ShortReads \
+  --assemblies "$IN/assemblies" \
+  --references "$IN/reference" \
+  --SJ-data "$IN/sj" \
+  --fastq "$IN/fastq" \
+  --SJ-reads $SJ_READS \
+  --genome "$GENOME_FA" \
+  --tpm $TPM \
+  --fragment-len "$FRAGMENT_LEN" \
+  --antisense-len "$ANTISENSE_LEN" \
+  --ram "$RAM" \
+  --keep "$KEEP" \
+  --outpath "$OUTDIR" \
+  --outname "$OUTNAME" \
+  --prefix "$PREFIX" \
+  --overwrite
+
+RTD_DIR="$OUTDIR/${OUTNAME}_RTDmaker_output"
+RTD_GTF="$RTD_DIR/${OUTNAME}.fixed.gtf"
+[ -s "$RTD_GTF" ] || RTD_GTF="$RTD_DIR/${OUTNAME}.gtf"
+require_file "$RTD_GTF"
+
+# transcript_id -> gene_id from the RTD annotation
+awk -F'\t' '$3=="transcript" || $3=="exon" {
+    t=""; g="";
+    if (match($9, /transcript_id "[^"]+"/)) t=substr($9, RSTART+15, RLENGTH-16);
+    if (match($9, /gene_id "[^"]+"/))       g=substr($9, RSTART+9,  RLENGTH-10);
+    if (t!="" && g!="" && !(t in seen)) { seen[t]=1; print t "\t" g }
+  }' "$RTD_GTF" > "$OUTDIR/tx2gene.tsv"
+require_file "$OUTDIR/tx2gene.tsv"
+
+log "RTD: $RTD_DIR"
+log "tx2gene: $OUTDIR/tx2gene.tsv ($(wc -l < "$OUTDIR/tx2gene.tsv" | tr -d ' ') transcripts, $(cut -f2 "$OUTDIR/tx2gene.tsv" | sort -u | wc -l | tr -d ' ') genes)"

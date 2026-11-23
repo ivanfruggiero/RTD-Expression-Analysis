@@ -1,0 +1,156 @@
+#!/bin/bash
+#PBS -N 03_screening
+#PBS -l select=1:ncpus=16:mem=64gb
+#PBS -l walltime=240:00:00
+#PBS -j oe
+#PBS -o logs/03_screening.log
+
+# Step 03 - Removal of reads from contaminant organisms (HISAT2 + samtools + seqtk).
+#
+# For each trimmed sample (step 02):
+#   1. align the reads with HISAT2 to every contaminant genome listed in CONTAMINANTS;
+#   2. collect the reads that align (primary alignments) to at least one contaminant;
+#   3. re-align those candidate reads to the HOST genome;
+#   4. reads that do NOT align to the host are true contaminants and are removed.
+# Reads shared by host and contaminant genomes (step 3 aligns them) are therefore kept.
+# For paired-end data a pair is removed when either mate is a true contaminant.
+#
+# CONTAMINANTS: tab-separated, '#' = comment, columns  name  source
+#   source = path to a FASTA file, or an NCBI assembly accession (GCF_/GCA_), which is downloaded
+#            with NCBI 'datasets' into GENOMES_DIR.
+# Output: OUTDIR/clean/{paired,single}/<BP>/<SAMPLE>[_1|_2].trimmed.fastq.gz  (same names as step 02)
+#         OUTDIR/summary.tsv  (reads aligned to each contaminant and reads removed, per sample)
+
+set -euo pipefail
+source "${PBS_O_WORKDIR:-$PWD}/script/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: qsub -v CONTAMINANTS=config/contaminants.tsv[,HOST_FA=...] script/03_contamination_screening.pbs
+   or: bash script/03_contamination_screening.pbs -c CONTAMINANTS [-g HOST_FA] [-i TRIMDIR] [-o OUTDIR] [-t THREADS] [-f]
+  -c CONTAMINANTS  contaminant genome table (required; see config/example_contaminants.tsv)
+  -g HOST_FA       host genome FASTA                     (default: reference/genome.fa)
+  -i TRIMDIR       trimmed reads from step 02            (default: results/02_trimming/trimmed)
+  -o OUTDIR        output directory                      (default: results/03_screening)
+  -d GENOMES_DIR   genome FASTA and HISAT2 index folder  (default: reference/contaminants)
+  -t THREADS       threads                               (default: NCPUS or 16)
+  -f               re-process samples that already have clean reads
+USAGE
+}
+
+CONTAMINANTS=${CONTAMINANTS:-}
+HOST_FA=${HOST_FA:-reference/genome.fa}
+TRIMDIR=${TRIMDIR:-results/02_trimming/trimmed}
+OUTDIR=${OUTDIR:-results/03_screening}
+GENOMES_DIR=${GENOMES_DIR:-reference/contaminants}
+THREADS=${THREADS:-$(ncpus 16)}
+FORCE=${FORCE:-0}
+
+while getopts ":c:g:i:o:d:t:fh" opt; do
+  case $opt in
+    c) CONTAMINANTS=$OPTARG ;; g) HOST_FA=$OPTARG ;; i) TRIMDIR=$OPTARG ;; o) OUTDIR=$OPTARG ;;
+    d) GENOMES_DIR=$OPTARG ;; t) THREADS=$OPTARG ;; f) FORCE=1 ;;
+    h) usage; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+setup_env
+require_cmd hisat2 hisat2-build samtools seqtk
+[ -n "$CONTAMINANTS" ] || die "set CONTAMINANTS (contaminant genome table), e.g. -c config/contaminants.tsv"
+require_file "$CONTAMINANTS"; require_file "$HOST_FA"; require_dir "$TRIMDIR"
+export LC_ALL=C
+CLEAN="$OUTDIR/clean"; WORK="$OUTDIR/work"; IDX="$GENOMES_DIR/hisat2"
+mkdir -p "$CLEAN" "$WORK" "$IDX"
+
+# ---------------- genomes and indexes
+build_index() {  # name fasta
+  if [ -s "$IDX/$1.1.ht2" ] || [ -s "$IDX/$1.1.ht2l" ]; then log "[SKIP] index $1"; return; fi
+  log "hisat2-build $1"; hisat2-build -p "$THREADS" "$2" "$IDX/$1" > "$IDX/$1.build.log" 2>&1
+}
+build_index host "$HOST_FA"
+
+NAMES="$WORK/contaminant_names.txt"; : > "$NAMES"
+while IFS=$'\t' read -r name src _; do
+  case "$name" in ''|\#*) continue ;; esac
+  [ "$name" != host ] || die "'host' is reserved, rename that contaminant"
+  if [ -f "$src" ]; then
+    fa="$src"
+  else
+    fa="$GENOMES_DIR/$name.fa"
+    if [ ! -s "$fa" ]; then
+      require_cmd datasets unzip
+      log "download $name ($src)"
+      datasets download genome accession "$src" --include genome --filename "$WORK/$name.zip"
+      inner=$(unzip -Z1 "$WORK/$name.zip" | grep -E '\.(fna|fa|fasta)$' | head -1)
+      [ -n "$inner" ] || die "no FASTA in the download of $src"
+      unzip -p "$WORK/$name.zip" "$inner" > "$fa"; rm -f "$WORK/$name.zip"
+    fi
+  fi
+  grep -q '^>' "$fa" || die "not a FASTA file: $fa"
+  build_index "$name" "$fa"
+  echo "$name" >> "$NAMES"
+done < "$CONTAMINANTS"
+[ -s "$NAMES" ] || die "no contaminant genome in $CONTAMINANTS"
+log "contaminant genomes: $(tr '\n' ' ' < "$NAMES")"
+
+# ---------------- per sample
+SUMMARY="$OUTDIR/summary.tsv"
+[ -s "$SUMMARY" ] || printf 'bioproject\tsample\tlayout\tcontaminant\treads_aligned\n' > "$SUMMARY"
+
+# Read IDs of a FASTQ.gz: first word of the header without '@' (the name used by HISAT2 and seqtk).
+fq_ids() { gzip -dc "$1" | awk 'NR % 4 == 1 { print substr($1, 2) }'; }
+
+n=0
+while IFS=$'\t' read -r BP S R1 R2; do
+  if [ -n "$R2" ]; then layout=paired; else layout=single; fi
+  out="$CLEAN/$layout/$BP"; w="$WORK/$BP/$S"
+  if [ -n "$R2" ]; then OUT1="$out/${S}_1.trimmed.fastq.gz"; OUT2="$out/${S}_2.trimmed.fastq.gz"
+  else OUT1="$out/${S}.trimmed.fastq.gz"; OUT2=""; fi
+  if [ "$FORCE" -eq 0 ] && [ -s "$OUT1" ]; then log "[SKIP] $BP/$S"; continue; fi
+  first=$(gzip -dc "$R1" 2>/dev/null | head -1 || true)
+  if echo "$first" | awk '{ exit !($1 ~ /\/[12]$/) }'; then
+    die "$R1: read names end with /1 or /2; HISAT2 strips this suffix, so names would not match. Rename the reads first."
+  fi
+  mkdir -p "$out" "$w"
+  log "[RUN] $BP/$S ($layout)"
+
+  # 1-2. reads aligned (primary, mapped) to any contaminant
+  : > "$w/candidates.ids"
+  while read -r g; do
+    if [ -n "$R2" ]; then IN=(-1 "$R1" -2 "$R2"); else IN=(-U "$R1"); fi
+    hisat2 -p "$THREADS" --no-unal -x "$IDX/$g" "${IN[@]}" 2> "$w/$g.hisat2.log" \
+      | samtools view -F 260 - | cut -f1 | sort -u > "$w/$g.ids"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$BP" "$S" "$layout" "$g" "$(wc -l < "$w/$g.ids" | tr -d ' ')" >> "$SUMMARY"
+    cat "$w/$g.ids" >> "$w/candidates.ids"
+  done < "$NAMES"
+  sort -u "$w/candidates.ids" -o "$w/candidates.ids"
+
+  # 3-4. candidates that do not align to the host = true contaminants
+  if [ -s "$w/candidates.ids" ]; then
+    seqtk subseq "$R1" "$w/candidates.ids" | gzip > "$w/cand_1.fq.gz"
+    if [ -n "$R2" ]; then
+      seqtk subseq "$R2" "$w/candidates.ids" | gzip > "$w/cand_2.fq.gz"
+      IN=(-1 "$w/cand_1.fq.gz" -2 "$w/cand_2.fq.gz")
+    else
+      IN=(-U "$w/cand_1.fq.gz")
+    fi
+    hisat2 -p "$THREADS" -x "$IDX/host" "${IN[@]}" 2> "$w/host.hisat2.log" \
+      | samtools view -f 4 - | cut -f1 | sort -u > "$w/contaminants.ids"
+  else
+    : > "$w/contaminants.ids"
+  fi
+
+  # keep every read not in contaminants.ids
+  fq_ids "$R1" | sort -u > "$w/all.ids"
+  comm -23 "$w/all.ids" "$w/contaminants.ids" > "$w/keep.ids"
+  seqtk subseq "$R1" "$w/keep.ids" | gzip > "$OUT1"
+  [ -z "$R2" ] || seqtk subseq "$R2" "$w/keep.ids" | gzip > "$OUT2"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$BP" "$S" "$layout" "REMOVED" "$(wc -l < "$w/contaminants.ids" | tr -d ' ')" >> "$SUMMARY"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$BP" "$S" "$layout" "KEPT" "$(wc -l < "$w/keep.ids" | tr -d ' ')" >> "$SUMMARY"
+  rm -f "$w"/cand_*.fq.gz "$w/all.ids" "$w/keep.ids"
+  n=$((n + 1))
+done < <(list_trimmed_samples "$TRIMDIR")
+
+log "Screened $n sample(s). Clean reads: $CLEAN  Summary: $SUMMARY"
